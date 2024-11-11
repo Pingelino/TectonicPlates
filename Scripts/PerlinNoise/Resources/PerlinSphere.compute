@@ -1,0 +1,282 @@
+#pragma kernel PerlinSphere
+
+// Struct matching the C# struct
+struct ShaderPerlinNoiseSettings
+{
+    float scale;
+    int octaves;
+    float persistence;
+    float lacunarity;
+    float3 offset;
+    float rotation;
+    int priority;
+};
+
+// Compute buffer for multiple noise settings
+StructuredBuffer<ShaderPerlinNoiseSettings> Settings;
+
+// Output texture
+RWTexture2D<float4> Result;
+
+// Texture size and number of noise layers (settings count)
+int textureWidth;
+int textureHeight;
+int textureSize;
+int settingsCount;
+int totalPriority;
+
+// --- Settings and constants ---
+static const float PI = 3.14159265;
+// Camera settings
+float3 ViewParams;
+float4x4 CamLocalToWorldMatrix;
+float3 camPos;
+
+float4 backgroundColor;
+int useMap;
+float2 mercatorClamp;
+// --- Structures ---
+
+uint NextRandom(inout uint state)
+{
+	state = state * 747796405 + 2891336453;
+	uint result = ((state >> ((state >> 28) + 4)) ^ state) * 277803737;
+	result = (result >> 22) ^ result;
+	return result;
+}
+
+float RandomValue(inout uint state)
+{
+	return NextRandom(state) / 4294967295.0; // 2^32 - 1
+}
+
+// Random value in normal distribution (with mean=0 and sd=1)
+float RandomValueNormalDistribution(inout uint state)
+{
+	// Thanks to https://stackoverflow.com/a/6178290
+	float theta = 2 * 3.1415926 * RandomValue(state);
+	float rho = sqrt(-2 * log(RandomValue(state)));
+	return rho * cos(theta);
+}
+
+// Calculate a random direction
+float3 RandomDirection(int3 xyz)
+{
+    uint X = (uint)xyz.x;
+    uint Y = (uint)xyz.y;
+    uint Z = (uint)xyz.z;
+    uint state = (X + 23523) * 23523;
+	// Thanks to https://math.stackexchange.com/a/1585996
+	float x = RandomValueNormalDistribution(state);
+    state = state * (Y + 3634);
+	float y = RandomValueNormalDistribution(state);
+    state = state * (Z + 36234);
+	float z = RandomValueNormalDistribution(state);
+	return normalize(float3(x, y, z));
+}
+
+struct Ray
+{
+	float3 origin;
+	float3 dir;
+	float3 invDir;
+};
+// --- Buffers (and their sizes) ---	
+float3 RaySphereIntersection(float3 rayOrigin, float3 rayDir)
+{
+	float3 oc = rayOrigin;
+	float b = dot(oc, rayDir);
+	float c = dot(oc, oc) - 1;
+	float h = b * b - c;
+	if (h < 0)
+	{
+		return float3(0, 0, 0); // Background color
+	}
+	h = sqrt(h);
+	float t = -b - h;
+	// Get the intersection point
+	return rayOrigin + rayDir * t;
+}
+
+float2 hash(float2 xy)
+{
+    return frac(sin(float2(dot(xy, float2(127.1, 311.7)), dot(xy, float2(269.5, 183.3)))) * 43758.5453);
+}
+
+// Fade function for smooth interpolation (3rd degree polynomial)
+float fade(float t)
+{
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+// Linear interpolation
+float lerp(float a, float b, float t)
+{
+    return a + t * (b - a);
+    return (b - a) * ((t * (t * 6.0 - 15.0) + 10.0) * t * t * t) + a;
+}
+
+float4 perlinDot2D(float3 localPos, int3 cell, int zOffset)
+{
+    int3 cell00z = cell + int3(0, 0, zOffset);
+    int3 cell01z = cell + int3(1, 0, zOffset);
+    int3 cell10z = cell + int3(0, 1, zOffset);
+    int3 cell11z = cell + int3(1, 1, zOffset);
+
+    float3 gradient00z = RandomDirection(cell00z);
+    float3 gradient10z = RandomDirection(cell01z);
+    float3 gradient01z = RandomDirection(cell10z);
+    float3 gradient11z = RandomDirection(cell11z);
+
+    float3 dist00 = localPos - float3(0.0, 0.0, zOffset);
+    float3 dist10 = localPos - float3(1.0, 0.0, zOffset);
+    float3 dist01 = localPos - float3(0.0, 1.0, zOffset);
+    float3 dist11 = localPos - float3(1.0, 1.0, zOffset);
+
+    float dot00 = dot(gradient00z, dist00);
+    float dot10 = dot(gradient10z, dist10);
+    float dot01 = dot(gradient01z, dist01);
+    float dot11 = dot(gradient11z, dist11);
+
+    return float4(dot00, dot10, dot01, dot11);
+}
+
+// Perlin noise function for a given position
+float perlinNoise(float3 pos, ShaderPerlinNoiseSettings settings)
+{
+    // Apply scale and offset to position
+    pos = pos * settings.scale + settings.offset;
+    int3 cell = round(pos);
+    float3 localPos = (pos - cell) + 0.5;
+    float4 dotsZ0 = perlinDot2D(localPos, cell, 0);
+    float4 dotsZ1 = perlinDot2D(localPos, cell, 1);
+    float3 fadePos = float3(fade(localPos.x), fade(localPos.y), fade(localPos.z));
+    // Get fractional part of the position within the cell
+    
+    float nx00 = lerp(dotsZ0.x, dotsZ0.y, fadePos.x);
+    float nx10 = lerp(dotsZ0.z, dotsZ0.w, fadePos.x);
+
+    float nx01 = lerp(dotsZ1.x, dotsZ1.y, fadePos.x);
+    float nx11 = lerp(dotsZ1.z, dotsZ1.w, fadePos.x);
+
+    float ny0 = lerp(nx00, nx10, fadePos.y);
+    float ny1 = lerp(nx01, nx11, fadePos.y);
+
+    return lerp(ny0, ny1, fadePos.z);
+}
+
+float4 RayColor(float3 hitPoint)
+{
+    //return float4(hitPoint, 1.0);
+	// Check if the thread is within the texture bounds
+
+    // Get the normalized UV coordinates
+
+    // Initialize the final noise value and the normalization factor
+    float finalNoiseValue = 0.0;
+    float totalMaxAmplitude = 0.0;
+    
+    // Loop over all noise settings and accumulate the results
+    for (int i = 0; i < settingsCount; i++)
+    {
+        ShaderPerlinNoiseSettings settings = Settings[i];
+
+        float amplitude = 1.0;
+        float frequency = 1.0;
+        float noiseLayerValue = 0.0;
+        float maxAmplitude = 0.0;
+        //float r = settings.rotation;
+        //float2 rotatedUV = mul(float2x2(cos(r), -sin(r), sin(r), cos(r)), uv - 0.5);
+
+        // Compute the fractal Perlin noise for the current settings
+        for (int octave = 0; octave < settings.octaves; octave++)
+        {
+            noiseLayerValue += perlinNoise(hitPoint * frequency, settings) * amplitude;
+            maxAmplitude += amplitude;
+            amplitude *= settings.persistence;
+            frequency *= settings.lacunarity;
+        }
+
+        float currentPriority = (float)settings.priority / (float)totalPriority;
+        if(maxAmplitude != 0)
+            finalNoiseValue += (noiseLayerValue / maxAmplitude) * currentPriority;
+        totalMaxAmplitude += 1.0; // Each layer has a max amplitude of 1 when normalized
+    }
+
+    // Normalize the final noise value to [0, 1] range
+    //finalNoiseValue = (finalNoiseValue / totalMaxAmplitude + 1.0) * 0.5;
+    //finalNoiseValue = clamp(finalNoiseValue * 2, 0, 1.0);
+    // Write the final result to the output texture
+    return float4(0, clamp(finalNoiseValue, 0, 1.0), -50 * clamp(finalNoiseValue, -0.01, 0), 1.0);
+    //return float4(clamp(finalNoiseValue, 0, 1.0), clamp(finalNoiseValue, 0, 1.0), clamp(finalNoiseValue, 0, 1.0), 1.0);
+    return float4(finalNoiseValue, finalNoiseValue, finalNoiseValue, 1.0);
+}
+float2 CartesianToSpherical(float3 xyz)
+{
+    float latitude = asin(xyz.y);
+	float longitude = atan2(xyz.z, xyz.x);
+	return float2(latitude, longitude);
+}
+float3 SphericalToCartesian(float2 latLon)
+{
+    float x = cos(latLon.x) * cos(latLon.y);
+    float y = sin(latLon.x);
+    float z = cos(latLon.x) * sin(latLon.y);
+	return float3(x, y, z);
+}
+
+float3 GetPointFromMap(float2 xy)
+{
+    float longitude = xy.x * PI * 2.0;
+
+    float k = (mercatorClamp.y - mercatorClamp.x) / PI;
+    float m = (mercatorClamp.x + mercatorClamp.y) * 0.5;
+
+    float latitude = k * (xy.y * PI) + m;
+
+    float3 xyz = SphericalToCartesian(float2(latitude, longitude));
+    return xyz;
+}
+float3 PixelPointToRay(float2 xy)
+{
+    float3 pixelPointLocal = float3(xy, 1) * ViewParams;
+    float4 pPL = mul(CamLocalToWorldMatrix, float4(pixelPointLocal, 1.0));
+	float3 pixelPoint = float3(pPL.x, pPL.y, pPL.z);
+	float3 rayOrigin = camPos;//_WorldSpaceCameraPos;
+	float3 rayDir = normalize(pixelPoint - rayOrigin);
+    return rayDir;
+}
+float3 GetPointFromCam(float2 xy)
+{
+// Calculate pixel point
+	float3 rayDir = PixelPointToRay(xy);
+
+	float3 hitPoint = RaySphereIntersection(camPos, rayDir);
+    
+    return hitPoint;
+}
+// Main compute function
+[numthreads(8, 8, 1)]
+void PerlinSphere(uint3 id : SV_DispatchThreadID)
+{
+    float3 hitPoint = float3(0, 0, 0);
+    float2 xy = float2((float)id.x / (float)textureWidth, (float)id.y / (float)textureHeight) - 0.5;
+    float4 mult = 1.0;
+    if(useMap == 1)
+    {
+        hitPoint = GetPointFromMap(xy);
+    }
+    else
+    {
+        hitPoint = GetPointFromCam(xy);
+        if(length(hitPoint) == 0)
+	    {
+	    	Result[id.xy] = backgroundColor * mult;
+            return;
+	    }
+    }
+    
+	Result[id.xy] = RayColor(hitPoint) * mult;
+
+    
+}

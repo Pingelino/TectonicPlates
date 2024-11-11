@@ -1,0 +1,338 @@
+/*#pragma kernel PerlinNoiseGenerator
+
+// Struct matching the C# struct
+struct ShaderPerlinNoiseSettings
+{
+    float scale;
+    int octaves;
+    float persistence;
+    float lacunarity;
+    float2 offset;
+    float rotation;
+};
+
+// Compute buffer for multiple noise settings
+StructuredBuffer<ShaderPerlinNoiseSettings> Settings;
+
+// Output texture
+RWTexture2D<float4> Result;
+
+// Texture size and number of noise layers (settings count)
+int textureSize;
+int settingsCount;
+static const float PI = 3.14159265;
+// Simple hash function for random gradient generation
+float2 hash(float2 xy)
+{
+    return frac(sin(float2(dot(xy, float2(127.1, 311.7)), dot(xy, float2(269.5, 183.3)))) * 43758.5453);
+}
+
+// Fade function for smooth interpolation (3rd degree polynomial)
+float fade(float t)
+{
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+// Linear interpolation
+float lerp(float a, float b, float t)
+{
+    //return a + t * (b - a);
+    return (b - a) * ((t * (t * 6.0 - 15.0) + 10.0) * t * t * t) + a;
+}
+
+// Perlin noise function for a given position
+float perlinNoise(float2 pos, ShaderPerlinNoiseSettings settings)
+{
+    // Apply scale and offset to position
+    pos = pos * settings.scale + settings.offset;
+
+    // Get integer coordinates for the grid cell
+    int2 cell = int2(floor(pos));
+
+    // Get fractional part of the position within the cell
+    float2 localPos = frac(pos);
+
+    // Compute gradients at the corners of the grid cell
+    float2 gradient00 = hash(float2(cell.x, cell.y));
+    float2 gradient10 = hash(float2(cell.x + 1, cell.y));
+    float2 gradient01 = hash(float2(cell.x, cell.y + 1));
+    float2 gradient11 = hash(float2(cell.x + 1, cell.y + 1));
+
+    // Compute distance vectors from the corners to the current position
+    float2 dist00 = localPos - float2(0.0, 0.0);
+    float2 dist10 = localPos - float2(1.0, 0.0);
+    float2 dist01 = localPos - float2(0.0, 1.0);
+    float2 dist11 = localPos - float2(1.0, 1.0);
+
+    // Compute the dot products between gradients and distance vectors
+    float dot00 = dot(gradient00, dist00);
+    float dot10 = dot(gradient10, dist10);
+    float dot01 = dot(gradient01, dist01);
+    float dot11 = dot(gradient11, dist11);
+
+    // Apply the fade function to smooth the interpolation
+    float2 fadePos = float2(fade(localPos.x), fade(localPos.y));
+
+    // Linearly interpolate along the x-axis
+    float nx0 = lerp(dot00, dot10, fadePos.x);
+    float nx1 = lerp(dot01, dot11, fadePos.x);
+
+    // Interpolate along the y-axis and return the final noise value
+    return lerp(nx0, nx1, fadePos.y);
+}
+
+// Main compute function
+[numthreads(1, 1, 1)]
+void PerlinNoiseGenerator(uint3 id : SV_DispatchThreadID)
+{
+    // Check if the thread is within the texture bounds
+    if (id.x >= textureSize || id.y >= textureSize)
+        return;
+
+    // Get the normalized UV coordinates
+    float2 uv = float2(id.xy) / textureSize;
+
+    // Initialize the final noise value and the normalization factor
+    float finalNoiseValue = 0.0;
+    float totalMaxAmplitude = 0.0;
+
+    float radius = 0.5;
+    float d = distance(uv, float2(0.5, 0.5));
+    float c = 0;
+    if(d < radius)
+    {
+        float k = sin(d * PI / (2.0 * radius));
+        c = 1.0 - k * k * k * k * k * k * k * k;
+    }
+    
+
+
+    // Loop over all noise settings and accumulate the results
+    for (int i = 0; i < settingsCount; i++)
+    {
+        ShaderPerlinNoiseSettings settings = Settings[i];
+
+        float amplitude = 1.0;
+        float frequency = 1.0;
+        float noiseLayerValue = 0.0;
+        float maxAmplitude = 0.0;
+        float r = settings.rotation;
+        float2 rotatedUV = mul(float2x2(cos(r), -sin(r), sin(r), cos(r)), uv - 0.5);
+
+        // Compute the fractal Perlin noise for the current settings
+        for (int octave = 0; octave < settings.octaves; octave++)
+        {
+            noiseLayerValue += perlinNoise(rotatedUV * frequency, settings) * amplitude;
+            maxAmplitude += amplitude;
+            amplitude *= settings.persistence;
+            frequency *= settings.lacunarity;
+        }
+
+        // Normalize the noise layer value and accumulate it
+        finalNoiseValue += (noiseLayerValue / maxAmplitude);
+        totalMaxAmplitude += 1.0; // Each layer has a max amplitude of 1 when normalized
+    }
+    c = 1.0;
+    // Normalize the final noise value to [0, 1] range
+    finalNoiseValue = (finalNoiseValue / totalMaxAmplitude + 1.0) * 0.5;
+    Result[id.xy] = float4(finalNoiseValue, finalNoiseValue, finalNoiseValue, 1.0);
+    return;
+    //finalNoiseValue = clamp(finalNoiseValue * 2, 0, 1.0);
+    // Write the final result to the output texture
+    Result[id.xy] = float4(0, -1.0 * clamp(finalNoiseValue, -1.0, 0) * c, clamp(finalNoiseValue, 0, 1.0) * c, 1.0);
+}
+*/
+#pragma kernel PerlinNoiseGenerator
+
+// Struct matching the C# struct
+struct ShaderPerlinNoiseSettings
+{
+    float scale;
+    int octaves;
+    float persistence;
+    float lacunarity;
+    float3 offset;
+    float rotation;
+    int priority;
+};
+
+// Compute buffer for multiple noise settings
+StructuredBuffer<ShaderPerlinNoiseSettings> Settings;
+
+// Output texture
+RWTexture2D<float4> Result;
+
+// Texture size and number of noise layers (settings count)
+int textureSize;
+int settingsCount;
+int totalPriority;
+static const float PI = 3.14159265;
+// Simple hash function for random gradient generation
+
+float2 RandomVector(int2 xy)
+{
+    uint ux = (uint)xy.x;
+    uint uy = (uint)xy.y;
+    ux = ux * 747796405 + 2891336453;
+    uy = uy * 421794403 + 3512616426;
+    uint rx = ((ux >> ((ux >> 28) + 4)) ^ ux) * 217801737;
+    uint ry = ((uy >> ((uy >> 28) + 4)) ^ uy) * 378023123;
+
+	uint state = rx * ry;
+	uint result = (((state) >> ((state >> 28) + 4)) ^ state) * 277803737;
+	result = (result >> 22) ^ result;
+	
+    float theta = state / 4294967295.0 * 2.0 * PI;
+    return float2(cos(theta), sin(theta));
+}
+
+
+float2 hash(float2 xy)
+{
+    return frac(sin(float2(dot(xy, float2(127.1, 311.7)), dot(xy, float2(269.5, 183.3)))) * 43758.5453);
+}
+
+// Fade function for smooth interpolation (3rd degree polynomial)
+float fade(float t)
+{
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+// Linear interpolation
+float lerp(float a, float b, float t)
+{
+    return a + t * (b - a);
+    //return (b - a) * ((t * (t * 6.0 - 15.0) + 10.0) * t * t * t) + a;
+}
+
+// Perlin noise function for a given position
+float perlinNoise(float2 pos, ShaderPerlinNoiseSettings settings)
+{
+    // Apply scale and offset to position
+    pos = pos * settings.scale + float2(settings.offset.x, settings.offset.y);
+
+    // Get integer coordinates for the grid cell
+    int2 cell00 = int2(round(pos)) + int2(0, 0);
+    int2 cell01 = int2(round(pos)) + int2(1, 0);
+    int2 cell10 = int2(round(pos)) + int2(0, 1);
+    int2 cell11 = int2(round(pos)) + int2(1, 1);
+
+    float2 gradient00 = RandomVector(cell00);
+    float2 gradient10 = RandomVector(cell01);
+    float2 gradient01 = RandomVector(cell10);
+    float2 gradient11 = RandomVector(cell11);
+
+    float2 localPos = (pos - cell00) + 0.5;
+
+    float2 dist00 = localPos - float2(0.0, 0.0);
+    float2 dist10 = localPos - float2(1.0, 0.0);
+    float2 dist01 = localPos - float2(0.0, 1.0);
+    float2 dist11 = localPos - float2(1.0, 1.0);
+
+    float dot00 = dot(gradient00, dist00);
+    float dot10 = dot(gradient10, dist10);
+    float dot01 = dot(gradient01, dist01);
+    float dot11 = dot(gradient11, dist11);
+    float2 fadePos = float2(fade(localPos.x), fade(localPos.y));
+    // Get fractional part of the position within the cell
+    
+    float nx0 = lerp(dot00, dot10, fadePos.x);
+    float nx1 = lerp(dot01, dot11, fadePos.x);
+
+    return lerp(nx0, nx1, fadePos.y);
+}
+// Perlin noise function for a given position
+float perlinNoiseTest(float2 pos, ShaderPerlinNoiseSettings settings)
+{
+    // Apply scale and offset to position
+    pos = pos * settings.scale + float2(settings.offset.x, settings.offset.y);
+
+    
+
+    // Get integer coordinates for the grid cell
+    int2 cell = int2(round(pos));
+    
+    // Get fractional part of the position within the cell
+    float2 localPos = pos - cell;
+    float2 gradient = RandomVector(int2(cell.x, cell.y));
+
+    return dot(normalize(localPos), gradient);
+}
+// Main compute function
+[numthreads(1, 1, 1)]
+void PerlinNoiseGenerator(uint3 id : SV_DispatchThreadID)
+{
+    // Check if the thread is within the texture bounds
+    if (id.x >= textureSize || id.y >= textureSize)
+        return;
+
+    // Get the normalized UV coordinates
+    float2 uv = float2(id.xy) / textureSize;
+
+    // Initialize the final noise value and the normalization factor
+    float finalNoiseValue = 0.0;
+    float totalMaxAmplitude = 0.0;
+
+    float radius = 0.5;
+    float d = distance(uv, float2(0.5, 0.5));
+    float c = 0;
+    if(d < radius)
+    {
+        float k = sin(d * PI / (2.0 * radius));
+        c = 1.0 - k * k * k * k * k * k * k * k;
+    }
+    
+
+
+    // Loop over all noise settings and accumulate the results
+    for (int i = 0; i < settingsCount; i++)
+    {
+        ShaderPerlinNoiseSettings settings = Settings[i];
+
+        float amplitude = 1.0;
+        float frequency = 1.0;
+        float noiseLayerValue = 0.0;
+        float maxAmplitude = 0.0;
+        float r = settings.rotation;
+        float2 rotatedUV = mul(float2x2(cos(r), -sin(r), sin(r), cos(r)), uv - 0.5);
+
+        // Compute the fractal Perlin noise for the current settings
+        for (int octave = 0; octave < settings.octaves; octave++)
+        {
+            float noiseValue = perlinNoise(rotatedUV * frequency, settings) * amplitude;
+            if(noiseValue == -10)
+            {
+                Result[id.xy] = float4(1.0, 0, 0, 1.0);
+                return;
+            }
+            if(noiseValue == -20)
+            {
+                Result[id.xy] = float4(0, 0, 1.0, 1.0);
+                return;
+            }
+            if(noiseValue == -30)
+            {
+                Result[id.xy] = float4(0, 1.0, 0, 1.0);
+                return;
+            }
+            noiseLayerValue += noiseValue;
+            
+            maxAmplitude += amplitude;
+            amplitude *= settings.persistence;
+            frequency *= settings.lacunarity;
+        }
+
+        // Normalize the noise layer value and accumulate it
+        float currentPriority = (float)settings.priority / (float)totalPriority;
+        finalNoiseValue += (noiseLayerValue / maxAmplitude) * currentPriority;
+        totalMaxAmplitude += 1.0; // Each layer has a max amplitude of 1 when normalized
+    }
+    c = 1.0;
+    // Normalize the final noise value to [0, 1] range
+    //finalNoiseValue = (finalNoiseValue / totalMaxAmplitude + 1.0) * 0.5;
+    Result[id.xy] = float4(0, clamp(finalNoiseValue, 0, 1.0), -1.0 * clamp(finalNoiseValue, -1.0, 0), 1.0);
+    return;
+    //finalNoiseValue = clamp(finalNoiseValue * 2, 0, 1.0);
+    // Write the final result to the output texture
+    Result[id.xy] = float4(0, -1.0 * clamp(finalNoiseValue, -1.0, 0) * c, clamp(finalNoiseValue, 0, 1.0) * c, 1.0);
+}
