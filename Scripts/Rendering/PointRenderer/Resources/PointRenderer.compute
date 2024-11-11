@@ -1,0 +1,811 @@
+#pragma kernel PointRenderer
+
+// RenderingPointObject structure to store sphere data
+struct RenderingPointObject
+{
+    float3 position;
+    float radius;
+    float4 color;
+};
+// Structured buffers for points and cells
+StructuredBuffer<RenderingPointObject> objects;
+StructuredBuffer<int2> cells;
+StructuredBuffer<int> indices;
+
+// Output texture
+RWTexture2D<float4> Result;
+
+cbuffer CameraBuffer
+{
+    float4x4 viewMatrix;
+    float4x4 projectionMatrix;
+    float4x4 inverseViewMatrix;     // Added inverse view matrix for transforming rays
+    float4x4 inverseProjectionMatrix; // Pass the inverse projection matrix from C# code
+    float3 cameraPosition;          // Camera world position
+    uint2 resolution;
+}
+float3 ViewParams;
+
+float3 boundsMin;
+float3 boundsMax;
+float gridSize;
+// Struct for ray data
+struct RayData
+{
+    float3 origin;
+    float3 direction;
+};
+
+struct CellIntersectionData
+{
+    int3 firstCell;
+    int3 lastCell;
+    int cellCount;
+};
+float3 rayCellOrigin;
+float3 rayCellDirection;
+float4 unitSphereColor;
+float4 backgroundColor;
+float pointSize;
+float3 WorldToGrid(float3 worldPos)
+{
+    float3 relativePos = worldPos - boundsMin;
+    float3 gridPos = relativePos / gridSize;
+    return gridPos;
+}
+
+float3 GridToWorld(float3 gridPos)
+{
+    float3 relativePos = gridPos * gridSize;
+    float3 worldPos = relativePos + boundsMin;
+    return worldPos;
+}
+float3 RayCellIntersection(RayData rayData, float3 cubeMin, float3 cubeMax, bool getFront)
+{
+    
+    float3 rayDir = rayData.direction;
+    float3 rayOrigin = rayData.origin;
+
+    // Initialize tMin and tMax for the intersection test
+    float tMin = 0.0f;
+    float tMax = 1e10f;
+    float3 planeNormal = float3(0.0f, 0.0f, 0.0f);
+
+    // Iterate over each axis (X, Y, Z)
+    for (int i = 0; i < 3; i++)
+    {
+        if (abs(rayDir[i]) < 1e-6f) // Ray is parallel to slab
+        {
+            // If the origin is not within the slab, no intersection
+            if (rayOrigin[i] < cubeMin[i] || rayOrigin[i] > cubeMax[i])
+            {
+                return float3(0.0f, 0.0f, 0.0f);
+            }
+        }
+        else
+        {
+            // Compute intersection distances with the slabs
+            float t1 = (cubeMin[i] - rayOrigin[i]) / rayDir[i];
+            float t2 = (cubeMax[i] - rayOrigin[i]) / rayDir[i];
+
+            // Swap t1 and t2 if necessary
+            if (t1 > t2)
+            {
+                float temp = t1;
+                t1 = t2;
+                t2 = temp;
+            }
+
+            // Update tMin and tMax
+            if (t1 > tMin)
+            {
+                tMin = t1;
+                planeNormal = float3(0.0f, 0.0f, 0.0f);
+                planeNormal[i] = (rayDir[i] < 0) ? 1.0f : -1.0f;
+            }
+            tMax = min(tMax, t2);
+
+            // If tMax < tMin, no intersection
+            if (tMax < tMin)
+            {
+                return float3(0.0f, 0.0f, 0.0f);
+            }
+        }
+    }
+
+    float tHit = tMin;
+    if(!getFront)
+        tHit = tMax;
+
+    if (tHit < 0.0f)
+    {
+        return float3(0.0f, 0.0f, 0.0f); // Intersection is behind the ray origin
+    }
+
+    // Calculate the hit point using the ray equation: hitPoint = rayOrigin + tHit * rayDir
+    float3 hitPoint = rayOrigin + tHit * rayDir;
+    return hitPoint;
+}
+int3 GetCellFromIndex(int cellIndex)
+{
+    float3 boundsSize = boundsMax - boundsMin;
+    int3 cellCount = ceil(boundsSize / gridSize);
+
+    int cellZ = cellIndex / (cellCount.x * cellCount.y);
+
+    int remainingIndex = cellIndex - cellZ * cellCount.x * cellCount.y;
+
+    int cellY = remainingIndex / cellCount.x;
+
+    int cellX = remainingIndex - cellY * cellCount.x;
+
+    int3 cell = int3(cellX, cellY, cellZ);
+
+    /*if(cell.x < 0 || cell.y < 0 || cell.z < 0)
+        return cellCount + int3(1, 0, 0);
+    if(cell.x > cellCount.x || cell.y > cellCount.y || cell.z > cellCount.z)
+        return cellCount + int3(1, 0, 0);*/
+    return cell - cellCount / 2;
+}
+float3 SortFloat3(float3 v)
+{
+    float a = v.x;
+    float b = v.y;
+    float c = v.z;
+
+    // Compare and swap to sort the values
+    if (a > b) { float temp = a; a = b; b = temp; }
+    if (a > c) { float temp = a; a = c; c = temp; }
+    if (b > c) { float temp = b; b = c; c = temp; }
+
+    // Return the sorted float3
+    return float3(a, b, c);
+}
+float3 PositionFromCell(int3 cell)
+{
+    float3 boundsSize = boundsMax - boundsMin;
+    int3 cellCount = ceil(boundsSize / gridSize);
+
+    int3 cellLocal = cell + cellCount / 2;
+
+    float3 cellPos = boundsMin + float3(cellLocal) * gridSize;
+
+    return cellPos;
+}
+float3 RayCellIntersection(RayData rayData, int cellIndex)
+{
+    int3 cell = GetCellFromIndex(cellIndex);
+    /*if(cell.x == ceil((boundsMax - boundsMin) / gridSize).x)
+        return float3(0, 0, 0);*/
+    float3 cellPos = PositionFromCell(cell);
+    float3 cubeMin = cellPos;
+    float3 cubeMax = cellPos + gridSize;
+    return RayCellIntersection(rayData, cubeMin, cubeMax, true);
+}
+float3 RaySphereIntersection(RayData rayData, float3 center, float radius)
+{
+    float3 rayOrigin = rayData.origin;
+    float3 rayDirection = rayData.direction;
+    radius = radius * length(rayData.origin);
+
+    float3 oc = rayOrigin - center;
+    float a = dot(rayDirection, rayDirection);
+    float b = 2.0 * dot(oc, rayDirection);
+    float c = dot(oc, oc) - radius * radius;
+
+    float discriminant = b * b - 4 * a * c;
+    float3 hitPoint = float3(0, 0, 0);
+
+    if (discriminant > 0)
+    {
+        // Calculate the nearest hit point using the smaller root
+        float t = (-b - sqrt(discriminant)) / (2.0 * a);
+        if (t > 0)
+        {
+            hitPoint = rayOrigin + t * rayDirection;
+        }
+    }
+    return hitPoint; // No intersection
+}
+// Ray-sphere intersection function
+bool RayIntersectsSphere(RayData rayData, float3 spherePosition, float sphereRadius, out float3 hitPoint)
+{
+    float3 rayOrigin = rayData.origin;
+    float3 rayDirection = rayData.direction;
+
+    float3 oc = rayOrigin - spherePosition;
+    float a = dot(rayDirection, rayDirection);
+    float b = 2.0 * dot(oc, rayDirection);
+    float c = dot(oc, oc) - sphereRadius * sphereRadius;
+
+    float discriminant = b * b - 4 * a * c;
+
+    if (discriminant > 0)
+    {
+        // Calculate the nearest hit point using the smaller root
+        float t = (-b - sqrt(discriminant)) / (2.0 * a);
+        if (t > 0)
+        {
+            hitPoint = rayOrigin + t * rayDirection;
+            return true; // Intersection found
+        }
+    }
+
+    hitPoint = float3(0.0, 0.0, 0.0);
+    return false; // No intersection
+}
+
+float3 RayPlaneIntersection(RayData rayData, float3 planePoint, float3 planeNormal)
+{
+    float3 rayOrigin = rayData.origin;
+    float3 rayDirection = rayData.direction;
+
+    float3 offset = rayOrigin - planePoint;
+
+    float denom = dot(planeNormal, rayDirection);
+
+    if(denom == 0)
+        return float3(0, 0, 0);
+    if(denom < 0)
+        return rayOrigin;
+    float t = dot(planeNormal, planeNormal) / denom;
+
+    return rayOrigin + t * rayDirection;
+}
+
+RayData PixelToRay(uint2 pixel)
+{
+    float2 uv = float2(pixel) / float2(resolution);
+    float3 pixelPointLocal = float3((uv - 0.5), 1);
+    //float4 clipSpacePos = float4(uv * 2.0 - 1.0, -1.0, 1.0);
+    float3 pixelPoint = mul(inverseProjectionMatrix, float4(pixelPointLocal, 1));
+	float3 rayOrigin = cameraPosition;
+
+    float3 rayDirLocal = normalize(pixelPoint);
+	float3 rayDir = normalize(mul((float3x3)inverseViewMatrix, rayDirLocal));
+    RayData rayData;
+    rayData.origin = rayOrigin;
+    rayData.direction = rayDir;
+
+    return rayData;
+}
+
+
+
+float3 GetClosestHitPoint(RayData rayData, float3 hxMin, float3 hyMin, float3 hzMin, float3 hxMax, float3 hyMax, float3 hzMax)
+{
+    float dxMin = distance(rayData.origin, hxMin);
+    float dyMin = distance(rayData.origin, hyMin);
+    float dzMin = distance(rayData.origin, hzMin);
+    float dxMax = distance(rayData.origin, hxMax);
+    float dyMax = distance(rayData.origin, hyMax);
+    float dzMax = distance(rayData.origin, hzMax);
+
+    float minDist = dxMin;
+    if(dyMin < minDist)
+        minDist = dyMin;
+    if(dzMin < minDist)
+        minDist = dzMin;
+    if(dxMax < minDist)
+        minDist = dxMax;
+    if(dyMax < minDist)
+        minDist = dyMax;
+    if(dzMax < minDist)
+        minDist = dzMax;
+    
+    return rayData.origin + rayData.direction * minDist;
+}
+
+float3 GetFarthestHitPoint(RayData rayData, float3 hxMin, float3 hyMin, float3 hzMin, float3 hxMax, float3 hyMax, float3 hzMax)
+{
+    float dxMin = distance(rayData.origin, hxMin);
+    float dyMin = distance(rayData.origin, hyMin);
+    float dzMin = distance(rayData.origin, hzMin);
+    float dxMax = distance(rayData.origin, hxMax);
+    float dyMax = distance(rayData.origin, hyMax);
+    float dzMax = distance(rayData.origin, hzMax);
+
+    float maxDist = dxMin;
+    if(dyMin > maxDist)
+        maxDist = dyMin;
+    if(dzMin > maxDist)
+        maxDist = dzMin;
+    if(dxMax > maxDist)
+        maxDist = dxMax;
+    if(dyMax > maxDist)
+        maxDist = dyMax;
+    if(dzMax > maxDist)
+        maxDist = dzMax;
+    
+    return rayData.origin + rayData.direction * maxDist;
+}
+
+int3 CellFromPoint(float3 hitPoint)
+{
+    float3 localPos = hitPoint - boundsMin;
+    int3 cell = floor(hitPoint / gridSize);
+    return cell;
+}
+
+int GetCellIndex(int3 cell)
+{
+    int3 cellCount = ceil(((boundsMax - boundsMin) / gridSize));
+    int cellIndex = cell.x + cell.y * cellCount.x + cell.z * (cellCount.x * cellCount.y);
+    return cellIndex;
+}
+
+RayData GetCellIntersections(RayData rayData)
+{
+    RayData boundsRay;
+    boundsRay.origin = WorldToGrid(rayData.origin);
+    boundsRay.direction = rayData.direction;
+    float3 firstHit = RayCellIntersection(boundsRay, WorldToGrid(boundsMin), WorldToGrid(boundsMax), true) + 0.01;
+    float3 lastHit = RayCellIntersection(boundsRay, WorldToGrid(boundsMin), WorldToGrid(boundsMax), false) + 0.01;
+    boundsRay.origin = firstHit;
+    boundsRay.direction = rayData.direction * distance(firstHit, lastHit);
+
+    return boundsRay;
+    /*int3 firstCell = floor(firstHit);
+    int3 lastCell = floor(lastHit);
+    int3 difference = abs(firstCell - lastCell);
+    int cellCount = 1 + difference.x + difference.y + difference.z;
+
+    
+
+    CellIntersectionData cellIntersectionData;
+    cellIntersectionData.firstCell = firstCell;
+    cellIntersectionData.lastCell = lastCell;
+    cellIntersectionData.cellCount = cellCount;
+    return cellIntersectionData;*/
+}
+
+int3 GetCellFromIntersectionIndex(RayData boundsRay, int intersectionIndex)
+{
+    float3 positiveCoordinateMatrix = float3(sign(boundsRay.direction.x), sign(boundsRay.direction.y), sign(boundsRay.direction.z));
+
+    float3 relativeDirection = boundsRay.direction * positiveCoordinateMatrix;
+    float3 relativeOrigin = ((boundsRay.origin * positiveCoordinateMatrix - floor(boundsRay.origin * positiveCoordinateMatrix)) + float3(1,1,1) * 0.01);
+
+    float t = ((float)intersectionIndex + 1.0 - (relativeOrigin.x + relativeOrigin.y + relativeOrigin.z)) / (relativeDirection.x + relativeDirection.y + relativeDirection.z);
+    float3 relativeHitPoint = relativeOrigin + t * relativeDirection;
+    int3 relativeCell = floor(relativeHitPoint);
+    int sum = relativeCell.x + relativeCell.y + relativeCell.z;
+    if(sum == intersectionIndex)
+        return floor(boundsRay.origin) + relativeCell * positiveCoordinateMatrix;
+    float3 distanceToNext = ceil(relativeHitPoint) - relativeHitPoint;
+    float3 tToNext = distanceToNext / relativeDirection;
+    float tMin = min(min(tToNext.x, tToNext.y), tToNext.z);
+    float3 nextHitPoint = relativeOrigin + (t + tMin) * relativeDirection;
+    int3 nextRelativeCell = floor(nextHitPoint + 0.01);
+    return floor(boundsRay.origin) + nextRelativeCell * positiveCoordinateMatrix;
+}
+int3 GetCellFromIntersectionIndexTest(RayData boundsRay, int intersectionIndex)
+{
+    /*RayData rayData;
+    rayData.origin = boundsRay.origin;
+    rayData.direction = normalize(boundsRay.direction);
+
+    
+    float3 rayOrigin = boundsRay.origin;
+    float3 rayOriginOffset = rayOrigin - floor(rayOrigin + normalize(rayData.direction) * 0.001);
+    float3 rayDir = normalize(boundsRay.direction);
+
+    float3 indexPoint = rayOriginOffset + float3(0.5, 0.5, 0.5) * (float)intersectionIndex;
+
+    float3 planeHitPoint = RayPlaneIntersection(rayData, indexPoint, boundsRay.direction);
+    return int3(floor(planeHitPoint));*/
+    float3 rayOrigin = boundsRay.origin;
+
+    float3 rayOriginOffset = (rayOrigin - floor(rayOrigin));
+    float3 rayDir = normalize(boundsRay.direction);
+    float3 coordinateFlipper = float3(sign(rayDir.x), sign(rayDir.y), sign(rayDir.z));
+    
+    float3 rayDirFlipped = rayDir * coordinateFlipper;
+    float3 offsetFlipped = rayOriginOffset * coordinateFlipper;
+
+    float3 h = rayOriginOffset / rayDir;
+
+    float t1 = (((float)intersectionIndex + 1) - (offsetFlipped.x + offsetFlipped.y + offsetFlipped.z)) / (rayDirFlipped.x + rayDirFlipped.y + rayDirFlipped.z);
+    float3 intersectionHitPoint = rayOrigin + rayDir * t1;
+
+    float3 intersectionHitPointFlipped = offsetFlipped + rayDirFlipped * t1;
+    int3 estimatedCell = floor(intersectionHitPointFlipped);
+    int total = estimatedCell.x + estimatedCell.y + estimatedCell.z;
+    if(total == intersectionIndex)
+        return floor(intersectionHitPoint);
+
+
+    float3 distanceToNext = ceil(intersectionHitPointFlipped) - intersectionHitPointFlipped;
+    float3 t2 = SortFloat3(distanceToNext / rayDirFlipped);
+
+    float t2Min = t2[(int)(abs(total - intersectionHitPoint) - 1)];
+    float3 nextIntersectionHitPoint = rayOrigin + rayDir * (t1 + t2Min);
+    int3 nextCell = floor(nextIntersectionHitPoint);
+    return nextCell;
+    //float3 deltaT = (ceil(abs(estimatedPoint)) - abs(estimatedPoint)) / abs(rayDir);
+    //float increment = 0;
+    //float3 deltaTNormalized = normalize(deltaT);
+    //int3 mask = int(floor(deltaTNormalized / max(max(deltaTNormalized.x, deltaTNormalized.y), deltaTNormalized.z) + 0.01));
+    int3 cell = floor(intersectionHitPoint);
+    return cell;
+}
+// Finds the closest intersecting object
+int FindClosestObject(RayData rayData, RayData boundsRay)
+{
+    int3 closestCell = -1;
+    int minIndex = -1;
+    float minDist = 1e6;
+
+    int3 firstCell = floor(boundsRay.origin);
+    int3 lastCell = floor(boundsRay.origin + boundsRay.direction);
+    int3 cellDifference = abs(firstCell - lastCell);
+    int cellCount = 1 + cellDifference.x + cellDifference.y + cellDifference.z;
+    
+    int closestObjectIndex = -1;
+    //float minDist = 1e6;
+
+    //int cellCount = distance(floor(boundsRay.origin), floor(boundsRay.origin + boundsRay.direction));
+    int3 totalCells = (boundsMax - boundsMin) / gridSize;
+    int totalCellCount = totalCells.x * totalCells.y * totalCells.z;
+    for(int i = 0; i < cellCount; i++)
+    {
+        int3 cell = GetCellFromIntersectionIndexTest(boundsRay, i);
+
+        int cellIndex = GetCellIndex(cell);
+
+        float3 hitPoint = RayCellIntersection(rayData, cellIndex);
+        if(length(hitPoint) != 0)
+        {
+            /*float dist = distance(rayData.origin, hitPoint);
+            if(dist < minDist)
+            {
+                closestCell = cell;
+                minIndex = i;
+                minDist = distance(rayData.origin, hitPoint);
+            }*/
+            if(cellIndex >= 0 || cellIndex < totalCellCount)
+            {
+                int2 objectIndices = cells[cellIndex];
+                for(int j = objectIndices.x; j < objectIndices.y; j++)
+                {
+                    int objectIndex = indices[j];
+                    RenderingPointObject object = objects[objectIndex];
+                    float3 hitPoint2 = RaySphereIntersection(rayData, object.position, object.radius);
+                    if(length(hitPoint2) != 0)
+                    {
+                        float dist = distance(hitPoint2, rayData.origin);
+                        if(dist < minDist)
+                        {
+                            minDist = dist;
+                            closestObjectIndex = objectIndex;
+                        }
+                    }
+                    //if(closestObjectIndex == -1)
+                    //    closestObjectIndex = -2;
+                }
+
+                if(closestObjectIndex > -1)
+                    break;
+            }
+        }
+    }
+
+    /*int closestObjectIndex = -1;
+    float minDist = 1e6;
+
+    int cellCount = distance(floor(boundsRay.origin), floor(boundsRay.origin + boundsRay.direction));
+    int3 totalCells = (boundsMax - boundsMin) / gridSize;
+    int totalCellCount = totalCells.x * totalCells.y * totalCells.z;
+    for(int i = 0; i < cellCount; i++)
+    {
+        int3 cell = GetCellFromIntersectionIndex(cellRayData, i);
+        int cellIndex = GetCellIndex(cell);
+        if(cellIndex >= 0 || cellIndex < totalCellCount)
+        {
+            int2 objectIndices = cells[cellIndex];
+            for(int j = objectIndices.x; j < objectIndices.y; j++)
+            {
+                int objectIndex = indices[j];
+                RenderingPointObject object = objects[objectIndex];
+                float3 hitPoint = RaySphereIntersection(rayData, object.position, object.radius);
+                if(length(hitPoint) != 0)
+                {
+                    float dist = distance(hitPoint, rayData.origin);
+                    if(dist < minDist)
+                    {
+                        minDist = dist;
+                        closestObjectIndex = objectIndex;
+                    }
+                }
+                if(closestObjectIndex == -1)
+                    closestObjectIndex = -2;
+            }
+            
+            if(closestObjectIndex > -1)
+                break;
+        }
+        
+        
+    }*/
+
+    return closestObjectIndex;
+}
+
+// Check against other alternatives (such as a unit sphere)
+int ConvertToAlternatives(RayData rayData)
+{
+    float3 hitPoint;
+    bool intersectsUnitSphere = RayIntersectsSphere(rayData, float3(0, 0, 0), 1.0, hitPoint);
+    if (intersectsUnitSphere)
+    {
+        return -2;
+    }
+    return -1;
+}
+
+// Get the color of the object or background
+float4 GetObjectColor(int objectIndex)
+{
+    /*if (objectIndex == -1)
+        return backgroundColor;
+
+    if (objectIndex == -2)
+        return unitSphereColor;
+
+    return objects[objectIndex].color;*/
+    if(objectIndex > 0)
+        return objects[objectIndex].color;
+    return float4(0, 0, 0, 0);
+}
+float3 RayAxisIntersectionFar(RayData rayData, float3 axis, float radius)
+{
+    float3 rayOrigin = rayData.origin;
+    float3 rayDir = rayData.direction;
+    // Ensure the axis is normalized
+    float3 normalizedAxis = normalize(axis);
+
+    radius = radius * length(rayData.origin);
+
+    // Project ray origin onto the plane perpendicular to the axis
+    float3 w = rayOrigin - dot(rayOrigin, normalizedAxis) * normalizedAxis;
+    float3 u = rayDir - dot(rayDir, normalizedAxis) * normalizedAxis;
+
+    float a = dot(u, u);
+    float b = 2.0f * dot(u, w);
+    float c = dot(w, w) - radius * radius;
+
+    // Solve the quadratic equation: at^2 + bt + c = 0
+    float discriminant = b * b - 4.0f * a * c;
+    if (discriminant < 0.0f)
+    {
+        return float3(0.0f, 0.0f, 0.0f); // No intersection
+    }
+
+    float sqrtDiscriminant = sqrt(discriminant);
+    float t1 = (-b - sqrtDiscriminant) / (2.0f * a);
+    float t2 = (-b + sqrtDiscriminant) / (2.0f * a);
+
+    // Find the closest positive t value
+    float tHit = (t2 >= 0.0f) ? t2 : ((t1 >= 0.0f) ? t1 : -1.0f);
+    if (tHit < 0.0f)
+    {
+        return float3(0.0f, 0.0f, 0.0f); // No valid intersection
+    }
+    // Calculate the hit point using the ray equation: hitPoint = rayOrigin + tHit * rayDir
+    float3 hitPoint = rayOrigin + t2 * rayDir;
+    // Ensure the hit point is within the bounds of the axis (cylinder extends along the axis direction)
+    float projectionLength = dot(hitPoint, normalizedAxis);
+    if (projectionLength < 0.0f || projectionLength > 1.0)
+    {
+        return float3(0.0f, 0.0f, 0.0f); // Hit point is outside valid range
+    }
+
+    return hitPoint;
+}
+float3 RayAxisIntersection(RayData rayData, float3 axis, float radius)
+{
+    float3 rayOrigin = rayData.origin;
+    float3 rayDir = rayData.direction;
+    // Ensure the axis is normalized
+    float3 normalizedAxis = normalize(axis);
+
+    radius = radius * length(rayData.origin);
+     
+
+    // Project ray origin onto the plane perpendicular to the axis
+    float3 w = rayOrigin - dot(rayOrigin, normalizedAxis) * normalizedAxis;
+    float3 u = rayDir - dot(rayDir, normalizedAxis) * normalizedAxis;
+
+    float a = dot(u, u);
+    float b = 2.0f * dot(u, w);
+    float c = dot(w, w) - radius * radius;
+
+    // Solve the quadratic equation: at^2 + bt + c = 0
+    float discriminant = b * b - 4.0f * a * c;
+    if (discriminant < 0.0f)
+    {
+        return float3(0.0f, 0.0f, 0.0f); // No intersection
+    }
+
+    float sqrtDiscriminant = sqrt(discriminant);
+    float t1 = (-b - sqrtDiscriminant) / (2.0f * a);
+    float t2 = (-b + sqrtDiscriminant) / (2.0f * a);
+
+    // Find the closest positive t value
+    float tHit = (t1 >= 0.0f) ? t1 : ((t2 >= 0.0f) ? t2 : -1.0f);
+    if (tHit < 0.0f)
+    {
+        return float3(0.0f, 0.0f, 0.0f); // No valid intersection
+    }
+    // Calculate the hit point using the ray equation: hitPoint = rayOrigin + tHit * rayDir
+    float3 hitPoint = rayOrigin + t1 * rayDir;
+    // Ensure the hit point is within the bounds of the axis (cylinder extends along the axis direction)
+    float projectionLength = dot(hitPoint, normalizedAxis);
+    if (projectionLength < 0.0f || projectionLength > 1.0)
+    {
+        return float3(0.0f, 0.0f, 0.0f); // Hit point is outside valid range
+    }
+
+    return hitPoint;
+}
+float4 RayAxisColor(RayData rayData)
+{
+    float radius = 1.0 / pow(2.0, 7);
+    float farMultiplier = 0.4;
+
+    float3 originHitPoint = RaySphereIntersection(rayData, float3(0, 0, 0), radius * 1.5);
+    if(length(originHitPoint) != 0)
+        return float4(0.35 + 0.65 * dot(rayData.direction, normalize(originHitPoint)) * float3(1.0, 1.0, 1.0), 1.0);
+    
+    float3 xAxis = RayAxisIntersection(rayData, float3(1.0, 0, 0), radius);
+    if(length(xAxis) != 0)
+        return float4(1.0, 0, 0, 1.0);
+    else if(length(RayAxisIntersectionFar(rayData, float3(1.0, 0, 0), radius)) != 0)
+        return float4(farMultiplier, 0, 0, 1.0);
+    float3 yAxis = RayAxisIntersection(rayData, float3(0, 1.0, 0), radius);
+    if(length(yAxis) != 0)
+        return float4(0, 1.0, 0, 1.0);
+    else if(length(RayAxisIntersectionFar(rayData, float3(0, 1.0, 0), radius)) != 0)
+        return float4(0, farMultiplier, 0, 1.0);
+    float3 zAxis = RayAxisIntersection(rayData, float3(0, 0, 1.0), radius);
+    if(length(zAxis) != 0)
+        return float4(0, 0, 1.0, 1.0);
+    else if(length(RayAxisIntersectionFar(rayData, float3(0, 0, 1.0), radius)) != 0)
+        return float4(0, 0, farMultiplier, 1.0);
+    return float4(0, 0, 0, 0);
+}
+float4 GetColorFromFace(RayData rayData, bool useFront)
+{
+    float3 hitPoint = RayCellIntersection(rayData, boundsMin, boundsMax, useFront);
+       
+    if(length(hitPoint) == 0)
+        return float4(0, 0, 0, 0);
+    
+    float3 face = float3(0, 0, 0);
+    if(abs(abs(hitPoint.x) - boundsMax.x) < 0.01)
+        face.x = boundsMax.x;
+    else if(abs(abs(hitPoint.y) - boundsMax.y) < 0.01)
+        face.y = boundsMax.y;
+    else if(abs(abs(hitPoint.z) - boundsMax.z) < 0.01)
+        face.z = boundsMax.z;
+    else
+        face = hitPoint;
+    float boundsShade = 0.5 + 0.5 * dot(normalize(float3(1.0, 1.0, 1.0)), normalize(face));
+    float4 faceColor = unitSphereColor;
+    if(useFront)
+        faceColor = backgroundColor;
+    return float4(faceColor.xyz * boundsShade, 1.0);
+}
+float4 GetBoundsColor(RayData rayData)
+{
+    //float3 hitMin = RayCellIntersection(rayData, boundsMin, boundsMax, true);
+    float4 colMin = GetColorFromFace(rayData, true);
+    float4 colMax = GetColorFromFace(rayData, false);
+
+    if(length(colMin) == 0 && length(colMax) == 0)
+        return float4(0, 0, 0, 0);
+
+    float frontTransparency = 0.4;
+    return float4(colMin.xyz * frontTransparency, 1.0) + float4(colMax.xyz * (1.0 - frontTransparency), 1.0);
+}
+float3 RayLineSegmentIntersection(RayData rayData, float3 lineStart, float3 lineEnd, float lineRadius)
+{
+    float3 rayOrigin = rayData.origin;
+    float3 rayDir = rayData.direction;
+    // Calculate the direction of the line segment
+    float3 lineDir = normalize(lineEnd - lineStart);
+    float lineLength = length(lineEnd - lineStart);
+
+    // Transform the ray to the line's local coordinate system
+    float3 lineToRay = rayOrigin - lineStart;
+    float3 w = lineToRay - dot(lineToRay, lineDir) * lineDir;
+    float3 u = rayDir - dot(rayDir, lineDir) * lineDir;
+
+    float a = dot(u, u);
+    float b = 2.0f * dot(u, w);
+    float c = dot(w, w) - lineRadius * lineRadius;
+
+    // Solve the quadratic equation: at^2 + bt + c = 0
+    float discriminant = b * b - 4.0f * a * c;
+    if (discriminant < 0.0f)
+    {
+        return float3(0.0f, 0.0f, 0.0f); // No intersection
+    }
+
+    float sqrtDiscriminant = sqrt(discriminant);
+    float t1 = (-b - sqrtDiscriminant) / (2.0f * a);
+    float t2 = (-b + sqrtDiscriminant) / (2.0f * a);
+
+    // Find the closest positive t value
+    float tHit = (t1 >= 0.0f) ? t1 : ((t2 >= 0.0f) ? t2 : -1.0f);
+    if (tHit < 0.0f)
+    {
+        return float3(0.0f, 0.0f, 0.0f); // No valid intersection
+    }
+
+    // Calculate the hit point using the ray equation: hitPoint = rayOrigin + tHit * rayDir
+    float3 hitPoint = rayOrigin + tHit * rayDir;
+
+    // Ensure the hit point is within the bounds of the line segment
+    float projectionLength = dot(hitPoint - lineStart, lineDir);
+    if (projectionLength < 0.0f || projectionLength > lineLength)
+    {
+        return float3(0.0f, 0.0f, 0.0f); // Hit point is outside valid range
+    }
+
+    return hitPoint;
+}
+RayData GetBoundsRay(RayData rayData)
+{
+    RayData tempBoundsRayData;
+    tempBoundsRayData.origin = WorldToGrid(rayData.origin);
+    tempBoundsRayData.direction = rayData.direction;
+    float3 firstHit = RayCellIntersection(tempBoundsRayData, WorldToGrid(boundsMin), WorldToGrid(boundsMax), true) + 0.01;
+    float3 lastHit = RayCellIntersection(tempBoundsRayData, WorldToGrid(boundsMin), WorldToGrid(boundsMax), false) + 0.01;
+
+    tempBoundsRayData.origin = firstHit;
+    tempBoundsRayData.direction = rayData.direction * distance(firstHit, lastHit);
+    return tempBoundsRayData;
+}
+// Computes the color for a given pixel
+float4 GetPixelColor(uint2 pixel)
+{
+    RayData rayData = PixelToRay(pixel);
+    RayData boundsRay;
+    boundsRay.origin = rayCellOrigin;
+    boundsRay.direction = rayCellDirection;
+    boundsRay = GetBoundsRay(boundsRay);
+
+
+    float4 rayAxisColor = RayAxisColor(rayData);
+    if(length(rayAxisColor) != 0)
+        return rayAxisColor;
+    int objectIndex = FindClosestObject(rayData, boundsRay);
+    /*if (objectIndex == -1)
+        objectIndex = ConvertToAlternatives(rayData);*/
+    float4 pixelColor = GetObjectColor(objectIndex);
+    if(length(pixelColor) != 0)
+        return pixelColor;
+
+    
+    //float3 brStart = float3(clamp(boundsRay.origin.x, boundsMin.x, boundsMax.x), clamp(boundsRay.origin.y, boundsMin.y, boundsMax.y), clamp(boundsRay.origin.z, boundsMin.z, boundsMax.z));
+    //float3 brEnd = float3(clamp(boundsRay.origin.x + rayCellDirection.x * 10.0, boundsMin.x, boundsMax.x), clamp(boundsRay.origin.y + rayCellDirection.y * 10.0, boundsMin.y, boundsMax.y), clamp(boundsRay.origin.z + rayCellDirection.z * 10.0, boundsMin.z, boundsMax.z));
+    float3 lineSegmentHitPoint = RayLineSegmentIntersection(rayData, GridToWorld(boundsRay.origin), GridToWorld(boundsRay.origin + boundsRay.direction), 1.0 / 320.0 / 2.0);
+    if(length(lineSegmentHitPoint) != 0)
+        return float4(0, 1.0, 1.0, 1.0);
+
+    float4 boundsColor = GetBoundsColor(rayData);
+    if(length(boundsColor) != 0)
+        return boundsColor;
+    return backgroundColor;
+}
+
+[numthreads(8, 8, 1)]
+void PointRenderer (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= resolution.x || id.y >= resolution.y)
+        return;
+
+    float4 color = GetPixelColor(id.xy);
+    Result[id.xy] = color;
+}
